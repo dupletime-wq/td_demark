@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Iterable
 
 import pandas as pd
@@ -10,6 +12,15 @@ from plotly.subplots import make_subplots
 
 from data_provider import DataProviderError, download_price_data
 from td_indicators import build_recent_signal_summary, build_signal_summary, compute_all_indicators
+from universe_provider import (
+    UNIVERSE_CUSTOM,
+    UNIVERSE_OPTIONS,
+    custom_watchlist_frame,
+    load_builtin_universe,
+    preview_symbols,
+    refresh_universe,
+    split_screening_results,
+)
 
 
 DEFAULT_WATCHLIST = "SPY, QQQ, AAPL, MSFT, NVDA, TSLA, BTC-USD, ETH-USD"
@@ -17,8 +28,24 @@ PERIOD_OPTIONS = ["3mo", "6mo", "1y", "2y", "5y", "10y"]
 INTERVAL_OPTIONS = ["1d", "1wk", "1mo"]
 DISPLAY_MODES = ["Precision", "Balanced", "Debug"]
 SCANNER_LOOKBACK = 20
+SCAN_BATCH_SIZE = 12
+SCAN_MAX_WORKERS = 4
+SCANNER_CACHE_TTL = 3600
 MAX_CHART_ROWS = 900
 MAX_SIGNAL_MARKERS = 40
+SCAN_DISPLAY_COLUMNS = [
+    "symbol",
+    "name",
+    "close",
+    "change_%",
+    "zone",
+    "quality",
+    "days_since_signal",
+    "top_score",
+    "bottom_score",
+    "reason",
+    "status",
+]
 SIGNAL_COLUMNS = [
     "close",
     "signal_zone",
@@ -218,6 +245,17 @@ def inject_css() -> None:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def cached_load_price_data(
+    ticker: str,
+    period: str,
+    interval: str,
+    auto_adjust: bool,
+) -> tuple[pd.DataFrame, str, str | None]:
+    result = download_price_data(ticker, period=period, interval=interval, auto_adjust=auto_adjust)
+    return result.frame, result.source, result.warning
+
+
+@st.cache_data(ttl=SCANNER_CACHE_TTL, show_spinner=False)
+def cached_scan_price_data(
     ticker: str,
     period: str,
     interval: str,
@@ -756,56 +794,273 @@ def signal_table(df: pd.DataFrame, limit: int = 80, raw: bool = False) -> pd.Dat
     )
 
 
-def run_scanner(tickers: list[str], period: str, interval: str, auto_adjust: bool) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
-    for ticker in tickers:
+def build_scan_row(
+    symbol: str,
+    name: str,
+    period: str,
+    interval: str,
+    auto_adjust: bool,
+) -> dict[str, object]:
+    try:
+        frame, source, warning = cached_scan_price_data(symbol, period, interval, auto_adjust)
+        indicators = compute_all_indicators(frame)
+        summary = build_recent_signal_summary(indicators, lookback=SCANNER_LOOKBACK)
+        change = pct_change(frame)
+        days_since = summary["days_since_signal"]
+        return {
+            "symbol": symbol,
+            "name": name or symbol,
+            "close": format_price(summary["close"]),
+            "change_%": f"{change:+.2f}" if math.isfinite(change) else "-",
+            "zone": summary["signal_zone"],
+            "quality": summary["signal_quality"] or summary["signal_strength"],
+            "days_since_signal": days_since if days_since is not None else "-",
+            "top_score": int(summary["top_exhaustion_score"]),
+            "bottom_score": int(summary["bottom_exhaustion_score"]),
+            "reason": summary["reason"],
+            "source": source,
+            "status": "fallback" if warning else "ok",
+            "_priority": int(summary["priority_score"]),
+            "_recency": days_since if days_since is not None else 9999,
+        }
+    except Exception as exc:
+        return {
+            "symbol": symbol,
+            "name": name or symbol,
+            "close": "-",
+            "change_%": "-",
+            "zone": "데이터 실패",
+            "quality": "없음",
+            "days_since_signal": "-",
+            "top_score": 0,
+            "bottom_score": 0,
+            "reason": "데이터 실패",
+            "source": "-",
+            "status": f"error: {str(exc)[:110]}",
+            "_priority": 0,
+            "_recency": 9999,
+        }
+
+
+def create_scan_state(
+    universe_name: str,
+    universe_frame: pd.DataFrame,
+    period: str,
+    interval: str,
+    auto_adjust: bool,
+) -> dict[str, object]:
+    queue = universe_frame[["symbol", "name"]].to_dict("records")
+    return {
+        "universe": universe_name,
+        "period": period,
+        "interval": interval,
+        "auto_adjust": auto_adjust,
+        "queue": queue,
+        "cursor": 0,
+        "completed": [],
+        "failed": [],
+        "running": True,
+        "cancel": False,
+        "started_at": time.time(),
+        "current_batch": [],
+        "total": len(queue),
+    }
+
+
+def process_next_scan_batch(state: dict[str, object]) -> None:
+    if not state.get("running"):
+        return
+    if state.get("cancel"):
+        state["running"] = False
+        state["current_batch"] = []
+        return
+
+    queue = list(state.get("queue", []))
+    cursor = int(state.get("cursor", 0))
+    total = int(state.get("total", len(queue)))
+    batch = queue[cursor : cursor + SCAN_BATCH_SIZE]
+    if not batch:
+        state["running"] = False
+        state["current_batch"] = []
+        return
+
+    state["current_batch"] = [str(item["symbol"]) for item in batch]
+    max_workers = min(SCAN_MAX_WORKERS, len(batch))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                build_scan_row,
+                str(item["symbol"]),
+                str(item.get("name", item["symbol"])),
+                str(state["period"]),
+                str(state["interval"]),
+                bool(state["auto_adjust"]),
+            ): item
+            for item in batch
+        }
+        for future in as_completed(futures):
+            row = future.result()
+            if row.get("status") in ["ok", "fallback"]:
+                state["completed"].append(row)
+            else:
+                state["failed"].append(row)
+
+    state["cursor"] = min(cursor + len(batch), total)
+    if state["cursor"] >= total or state.get("cancel"):
+        state["running"] = False
+        state["current_batch"] = []
+
+
+def scan_results_frame(state: dict[str, object] | None) -> pd.DataFrame:
+    if not state:
+        return pd.DataFrame(columns=SCAN_DISPLAY_COLUMNS)
+    rows = list(state.get("completed", [])) + list(state.get("failed", []))
+    if not rows:
+        return pd.DataFrame(columns=SCAN_DISPLAY_COLUMNS)
+    return pd.DataFrame(rows)
+
+
+def visible_scan_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    columns = [column for column in SCAN_DISPLAY_COLUMNS if column in frame.columns]
+    return frame[columns].copy()
+
+
+def active_universe_frame(universe_name: str, tickers: list[str]) -> tuple[pd.DataFrame, str | None]:
+    if universe_name == UNIVERSE_CUSTOM:
+        return custom_watchlist_frame(tickers), None
+
+    refreshed = st.session_state.get("refreshed_universes", {}).get(universe_name)
+    if refreshed is not None:
+        return refreshed.copy(), None
+
+    try:
+        return load_builtin_universe(universe_name), None
+    except Exception as exc:
+        return pd.DataFrame(), str(exc)
+
+
+def render_scan_progress(state: dict[str, object]) -> None:
+    total = int(state.get("total", 0))
+    done = len(state.get("completed", [])) + len(state.get("failed", []))
+    failed = len(state.get("failed", []))
+    elapsed = max(time.time() - float(state.get("started_at", time.time())), 0.0)
+    ratio = 0.0 if total == 0 else min(done / total, 1.0)
+    label = f"{done}/{total} completed | failed {failed} | elapsed {elapsed:.1f}s"
+    st.progress(ratio, text=label)
+    current_batch = state.get("current_batch", [])
+    if state.get("running") and current_batch:
+        st.caption(f"Current batch: {', '.join(current_batch)}")
+    if state.get("cancel") and state.get("running"):
+        st.warning("Stop requested. 현재 배치가 끝나면 멈춥니다.")
+
+
+def render_scan_results(state: dict[str, object] | None) -> None:
+    results = scan_results_frame(state)
+    if results.empty:
+        st.info("Start Scan을 누르면 선택한 유니버스의 Top/Bottom 후보가 여기에 표시됩니다.")
+        return
+
+    top, bottom, all_rows = split_screening_results(results)
+    top_tab, bottom_tab, all_tab = st.tabs(["Top candidates", "Bottom candidates", "All / Failures"])
+    with top_tab:
+        st.dataframe(visible_scan_columns(top), width="stretch", hide_index=True)
+    with bottom_tab:
+        st.dataframe(visible_scan_columns(bottom), width="stretch", hide_index=True)
+    with all_tab:
+        st.dataframe(visible_scan_columns(all_rows), width="stretch", hide_index=True)
+        failures = all_rows.loc[~all_rows.get("status", "ok").isin(["ok", "fallback"])] if not all_rows.empty else pd.DataFrame()
+        if not failures.empty:
+            st.markdown("<div class='section-label'>Failures</div>", unsafe_allow_html=True)
+            st.dataframe(visible_scan_columns(failures), width="stretch", hide_index=True)
+
+
+def render_scanner_view(
+    universe_name: str,
+    tickers: list[str],
+    period: str,
+    interval: str,
+    auto_adjust: bool,
+) -> None:
+    render_header("Scanner")
+    st.markdown("<div class='section-label'>Universe scanner</div>", unsafe_allow_html=True)
+
+    universe_frame, universe_error = active_universe_frame(universe_name, tickers)
+    source = "-"
+    as_of = "-"
+    if not universe_frame.empty:
+        source = str(universe_frame["source"].iloc[0])
+        as_of = str(universe_frame["as_of"].iloc[0])
+
+    col_count, col_source, col_period = st.columns([1, 2, 1])
+    col_count.metric("Universe", f"{len(universe_frame):,}", universe_name)
+    col_source.metric("Source", source[:34] + ("..." if len(source) > 34 else ""), f"as of {as_of}")
+    col_period.metric("Scan Window", period, interval)
+
+    if universe_error:
+        st.error(universe_error)
+
+    action_cols = st.columns([1.1, 1, 1.35, 1, 4])
+    with action_cols[0]:
+        refresh_clicked = st.button("Refresh Universe", disabled=universe_name == UNIVERSE_CUSTOM)
+    with action_cols[1]:
+        start_clicked = st.button("Start Scan", type="primary", disabled=universe_frame.empty)
+    with action_cols[2]:
+        running = bool(st.session_state.get("scan_state", {}).get("running"))
+        stop_clicked = st.button("Stop after current batch", disabled=not running)
+    with action_cols[3]:
+        clear_clicked = st.button("Clear Results")
+
+    if refresh_clicked:
         try:
-            frame, source, warning = cached_load_price_data(ticker, period, interval, auto_adjust)
-            indicators = cached_compute_indicators(frame)
-            summary = build_recent_signal_summary(indicators, lookback=SCANNER_LOOKBACK)
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "close": format_price(summary["close"]),
-                    "change_%": f"{pct_change(frame):+.2f}" if math.isfinite(pct_change(frame)) else "-",
-                    "zone": summary["signal_zone"],
-                    "quality": summary["signal_quality"] or summary["signal_strength"],
-                    "days_since_signal": summary["days_since_signal"] if summary["days_since_signal"] is not None else "-",
-                    "top_score": summary["top_exhaustion_score"],
-                    "bottom_score": summary["bottom_exhaustion_score"],
-                    "reason": summary["reason"],
-                    "source": source,
-                    "status": "fallback" if warning else "ok",
-                    "_priority": summary["priority_score"],
-                    "_recency": summary["days_since_signal"] if summary["days_since_signal"] is not None else 9999,
-                }
+            result = refresh_universe(universe_name)
+            st.session_state.setdefault("refreshed_universes", {})[universe_name] = result.frame
+            st.session_state["universe_refresh_message"] = (
+                f"{universe_name} refreshed: {len(result.frame):,} symbols from {result.source}"
             )
+            st.session_state["universe_refresh_warning"] = result.warning
         except Exception as exc:
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "close": "-",
-                    "change_%": "-",
-                    "zone": "데이터 실패",
-                    "quality": "없음",
-                    "days_since_signal": "-",
-                    "top_score": 0,
-                    "bottom_score": 0,
-                    "reason": "데이터 실패",
-                    "source": "-",
-                    "status": str(exc)[:120],
-                    "_priority": 0,
-                    "_recency": 9999,
-                }
-            )
-    table = pd.DataFrame(rows)
-    if not table.empty:
-        table = table.sort_values(["_priority", "_recency", "top_score", "bottom_score"], ascending=[False, True, False, False])
-        table = table.drop(columns=["_priority", "_recency"])
-    return table
+            st.session_state["universe_refresh_message"] = ""
+            st.session_state["universe_refresh_warning"] = f"{universe_name} refresh failed: {exc}"
+        st.rerun()
+
+    refresh_message = st.session_state.get("universe_refresh_message")
+    refresh_warning = st.session_state.get("universe_refresh_warning")
+    if refresh_message:
+        st.success(refresh_message)
+    if refresh_warning:
+        st.warning(refresh_warning)
+
+    if start_clicked:
+        st.session_state.scan_state = create_scan_state(universe_name, universe_frame, period, interval, auto_adjust)
+        st.rerun()
+    if stop_clicked and "scan_state" in st.session_state:
+        st.session_state.scan_state["cancel"] = True
+        st.rerun()
+    if clear_clicked:
+        st.session_state.pop("scan_state", None)
+        st.session_state.pop("scan_results", None)
+        st.rerun()
+
+    state = st.session_state.get("scan_state")
+    if state:
+        progress_slot = st.empty()
+        with progress_slot.container():
+            render_scan_progress(state)
+        if state.get("running"):
+            process_next_scan_batch(state)
+            progress_slot.empty()
+            with progress_slot.container():
+                render_scan_progress(state)
+            if state.get("running"):
+                time.sleep(0.15)
+                st.rerun()
+    else:
+        st.caption("대형 유니버스는 자동 실행하지 않습니다. Start Scan을 눌러야 Yahoo 요청이 시작됩니다.")
+
+    render_scan_results(st.session_state.get("scan_state"))
 
 
-def sidebar_controls() -> tuple[str, str, str, bool, list[str], bool, bool, bool, str]:
+def sidebar_controls() -> tuple[str, str, str, bool, list[str], str, bool, bool, bool, str]:
     if "watchlist_text" not in st.session_state:
         st.session_state.watchlist_text = DEFAULT_WATCHLIST
     if "active_view" not in st.session_state:
@@ -823,11 +1078,37 @@ def sidebar_controls() -> tuple[str, str, str, bool, list[str], bool, bool, bool
     show_starc = st.sidebar.toggle("STARC-style", value=True)
     show_mfi = st.sidebar.toggle("MFI Panel", value=True)
 
-    st.sidebar.markdown("### Watchlist")
-    watchlist_text = st.sidebar.text_area("Tickers", key="watchlist_text", height=118)
-    tickers = parse_watchlist(watchlist_text)
-    st.sidebar.caption(f"{len(tickers)} / 25 tickers")
-    return ticker.strip().upper(), period, interval, auto_adjust, tickers, show_bollinger, show_starc, show_mfi, display_mode
+    st.sidebar.markdown("### Scanner")
+    universe_name = st.sidebar.selectbox("Universe", UNIVERSE_OPTIONS, index=0, key="scanner_universe")
+    if universe_name == UNIVERSE_CUSTOM:
+        watchlist_text = st.sidebar.text_area("Tickers", key="watchlist_text", height=118)
+        tickers = parse_watchlist(watchlist_text)
+        st.sidebar.caption(f"{len(tickers)} / 25 tickers")
+    else:
+        tickers = parse_watchlist(st.session_state.watchlist_text)
+        preview_frame, preview_error = active_universe_frame(universe_name, tickers)
+        if preview_error:
+            st.sidebar.warning(preview_error)
+        else:
+            st.sidebar.text_area(
+                "Universe preview",
+                value=preview_symbols(preview_frame, limit=40),
+                height=170,
+                disabled=True,
+            )
+            st.sidebar.caption(f"{len(preview_frame):,} symbols loaded")
+    return (
+        ticker.strip().upper(),
+        period,
+        interval,
+        auto_adjust,
+        tickers,
+        universe_name,
+        show_bollinger,
+        show_starc,
+        show_mfi,
+        display_mode,
+    )
 
 
 def main() -> None:
@@ -838,6 +1119,7 @@ def main() -> None:
         interval,
         auto_adjust,
         tickers,
+        universe_name,
         show_bollinger,
         show_starc,
         show_mfi,
@@ -853,13 +1135,7 @@ def main() -> None:
     )
 
     if active_view == "멀티 스캐너":
-        render_header("Scanner")
-        st.markdown("<div class='section-label'>Watchlist scanner</div>", unsafe_allow_html=True)
-        run_clicked = st.button("스캔 실행", type="primary")
-        if run_clicked or "scan_results" not in st.session_state:
-            with st.spinner("Yahoo 데이터와 TD 신호를 계산하는 중입니다."):
-                st.session_state.scan_results = run_scanner(tickers, period, interval, auto_adjust)
-        st.dataframe(st.session_state.scan_results, width="stretch", hide_index=True)
+        render_scanner_view(universe_name, tickers, period, interval, auto_adjust)
         return
 
     try:
