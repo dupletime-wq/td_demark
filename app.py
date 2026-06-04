@@ -17,10 +17,11 @@ PERIOD_OPTIONS = ["3mo", "6mo", "1y", "2y", "5y", "10y"]
 INTERVAL_OPTIONS = ["1d", "1wk", "1mo"]
 SIGNAL_COLUMNS = [
     "close",
+    "signal_zone",
     "signal_side",
     "signal_strength",
-    "bearish_exhaustion_score",
-    "bullish_exhaustion_score",
+    "top_exhaustion_score",
+    "bottom_exhaustion_score",
     "td_sell_setup",
     "td_buy_setup",
     "td_sell_countdown",
@@ -131,6 +132,42 @@ def inject_css() -> None:
             font-size: 0.86rem;
             margin: 8px 0 16px 0;
         }
+        .guide-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 12px;
+            margin: 10px 0 8px 0;
+        }
+        .guide-card {
+            min-height: 132px;
+            border: 1px solid var(--line);
+            border-radius: 8px;
+            background: linear-gradient(180deg, rgba(21, 31, 42, 0.84), rgba(13, 20, 28, 0.88));
+            padding: 13px 14px;
+        }
+        .guide-card .kicker {
+            color: var(--muted);
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+        .guide-card .headline {
+            color: var(--text);
+            font-size: 1.02rem;
+            font-weight: 700;
+            margin: 8px 0 6px 0;
+        }
+        .guide-card .body {
+            color: #b7c6d3;
+            font-size: 0.84rem;
+            line-height: 1.48;
+        }
+        .guide-card.top {
+            border-color: rgba(255, 92, 112, 0.35);
+        }
+        .guide-card.bottom {
+            border-color: rgba(65, 211, 138, 0.35);
+        }
         .section-label {
             color: var(--muted);
             text-transform: uppercase;
@@ -159,6 +196,9 @@ def inject_css() -> None:
             }
             .badge-row {
                 justify-content: flex-start;
+            }
+            .guide-grid {
+                grid-template-columns: 1fr;
             }
         }
         </style>
@@ -229,7 +269,7 @@ def render_header(ticker: str, source: str | None = None) -> None:
         <div class="title-row">
             <div>
                 <h1>TD DeMark Exhaustion Lab · {ticker}</h1>
-                <div class="sub">TD Combo Approx, Sequential Countdown, MFI divergence, volatility exhaustion</div>
+                <div class="sub">Top and bottom exhaustion map with TD Combo Approx, MFI divergence, and volatility filters</div>
             </div>
             <div class="badge-row">
                 <span class="badge">Yahoo Finance</span>
@@ -244,7 +284,7 @@ def render_header(ticker: str, source: str | None = None) -> None:
     st.markdown(
         """
         <div class="notice">
-            DeMARK 공식 상용 지표가 아닌 공개 규칙 기반 근사 구현입니다. 현재 환경 호환성을 위해 Yahoo 요청의 SSL 검증은 우회됩니다.
+            고점 후보와 저점 후보를 모두 계산합니다. DeMARK 공식 상용 지표가 아닌 공개 규칙 기반 근사 구현이며, 현재 환경 호환성을 위해 Yahoo 요청의 SSL 검증은 우회됩니다.
         </div>
         """,
         unsafe_allow_html=True,
@@ -256,10 +296,41 @@ def render_metrics(frame: pd.DataFrame, indicators: pd.DataFrame, summary: dict[
     last_date = pd.Timestamp(indicators.index[-1]).strftime("%y-%m-%d")
     columns = st.columns(5)
     columns[0].metric("Last Close", format_price(summary["close"]), f"{change:+.2f}%" if math.isfinite(change) else None)
-    columns[1].metric("Signal", str(summary["signal_strength"]), str(summary["signal_side"]))
-    columns[2].metric("Bearish Score", str(summary["bearish_exhaustion_score"]), "상승 추세 소진")
-    columns[3].metric("Bullish Score", str(summary["bullish_exhaustion_score"]), "하락 추세 소진")
+    columns[1].metric("Active Zone", str(summary["signal_zone"]), str(summary["signal_strength"]))
+    columns[2].metric("Top Score", str(summary["top_exhaustion_score"]), "고점 후보")
+    columns[3].metric("Bottom Score", str(summary["bottom_exhaustion_score"]), "저점 후보")
     columns[4].metric("Last Bar", last_date, source)
+
+
+def render_reading_guide() -> None:
+    st.markdown("<div class='section-label'>How to read the map</div>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="guide-grid">
+            <div class="guide-card top">
+                <div class="kicker">Top setup</div>
+                <div class="headline">고점 후보</div>
+                <div class="body">빨간 계열 마커와 Top Score는 상승 추세가 과열되어 고점 반전 후보가 생겼다는 뜻입니다. S7/S8은 예열, S9는 setup 완성, D13/C13은 소진 완성 후보입니다.</div>
+            </div>
+            <div class="guide-card bottom">
+                <div class="kicker">Bottom setup</div>
+                <div class="headline">저점 후보</div>
+                <div class="body">초록/시안 계열 마커와 Bottom Score는 하락 추세가 소진되어 저점 반등 후보가 생겼다는 뜻입니다. B7/B8은 예열, B9는 setup 완성, D13/C13은 소진 완성 후보입니다.</div>
+            </div>
+            <div class="guide-card">
+                <div class="kicker">Levels</div>
+                <div class="headline">7 · 8 · 9 · 13</div>
+                <div class="body">7/8은 조기 경보, 9는 setup 완료, 13은 countdown 또는 combo 완료입니다. 13만 기다리면 늦을 수 있어 진행 숫자를 모두 표시합니다.</div>
+            </div>
+            <div class="guide-card">
+                <div class="kicker">Confirmation</div>
+                <div class="headline">단독 신호 금지</div>
+                <div class="body">점수 1-2는 관찰, 3-5는 주의, 6 이상은 강함입니다. MFI divergence, 밴드 재진입, 직전 지지/저항과 함께 확인합니다.</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def build_chart(
@@ -305,30 +376,11 @@ def build_chart(
 
     marker_y_sell = df["high"] * 1.01
     marker_y_buy = df["low"] * 0.99
-    add_marker(
-        fig,
-        df,
-        first_completion(df["td_sell_setup"]),
-        marker_y_sell,
-        "Sell Setup 9",
-        "#ff5c70",
-        "triangle-down",
-        "S9",
-    )
-    add_marker(
-        fig,
-        df,
-        first_completion(df["td_buy_setup"]),
-        marker_y_buy,
-        "Buy Setup 9",
-        "#41d38a",
-        "triangle-up",
-        "B9",
-    )
-    add_marker(fig, df, df["td_sell_countdown"] == 13, marker_y_sell, "Sell Countdown 13", "#ff8a9a", "x", "13")
-    add_marker(fig, df, df["td_buy_countdown"] == 13, marker_y_buy, "Buy Countdown 13", "#6de0a3", "x", "13")
-    add_marker(fig, df, df["td_sell_combo"] == 13, marker_y_sell * 1.015, "Sell Combo 13", "#f1bd4b", "diamond", "C13")
-    add_marker(fig, df, df["td_buy_combo"] == 13, marker_y_buy * 0.985, "Buy Combo 13", "#48b7ff", "diamond", "C13")
+    add_td_level_markers(fig, df, marker_y_sell, marker_y_buy)
+    top_filter = df["mfi_bearish_divergence"] | df["bb_sell_reentry"] | df["starc_sell_reentry"] | df["td_camouflage_sell"]
+    bottom_filter = df["mfi_bullish_divergence"] | df["bb_buy_reentry"] | df["starc_buy_reentry"] | df["td_camouflage_buy"]
+    add_marker(fig, df, top_filter, marker_y_sell * 1.025, "고점 후보 보조 신호", "#ff5c70", "circle", "TOP")
+    add_marker(fig, df, bottom_filter, marker_y_buy * 0.975, "저점 후보 보조 신호", "#48b7ff", "circle", "LOW")
 
     if show_mfi:
         fig.add_trace(
@@ -408,6 +460,95 @@ def first_completion(series: pd.Series) -> pd.Series:
     return (series == 9) & (series.shift(1).fillna(0) != 9)
 
 
+def setup_level_mask(series: pd.Series, level: int) -> pd.Series:
+    if level == 9:
+        return first_completion(series)
+    return series == level
+
+
+def add_td_level_markers(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    marker_y_sell: pd.Series,
+    marker_y_buy: pd.Series,
+) -> None:
+    setup_levels = (7, 8, 9)
+    countdown_levels = (7, 8, 9, 13)
+    combo_levels = (7, 8, 9, 13)
+
+    for level in setup_levels:
+        sell_offset = 1.000 + (level - 7) * 0.010
+        buy_offset = 1.000 - (level - 7) * 0.010
+        add_marker(
+            fig,
+            df,
+            setup_level_mask(df["td_sell_setup"], level),
+            marker_y_sell * sell_offset,
+            f"고점 후보 Setup S{level}",
+            "#ff5c70",
+            "triangle-down",
+            f"S{level}",
+        )
+        add_marker(
+            fig,
+            df,
+            setup_level_mask(df["td_buy_setup"], level),
+            marker_y_buy * buy_offset,
+            f"저점 후보 Setup B{level}",
+            "#41d38a",
+            "triangle-up",
+            f"B{level}",
+        )
+
+    for level in countdown_levels:
+        sell_offset = 1.020 + (0.006 if level == 13 else (level - 7) * 0.006)
+        buy_offset = 0.980 - (0.006 if level == 13 else (level - 7) * 0.006)
+        add_marker(
+            fig,
+            df,
+            df["td_sell_countdown"] == level,
+            marker_y_sell * sell_offset,
+            f"고점 후보 Countdown D{level}",
+            "#ff8a9a",
+            "x",
+            f"D{level}",
+        )
+        add_marker(
+            fig,
+            df,
+            df["td_buy_countdown"] == level,
+            marker_y_buy * buy_offset,
+            f"저점 후보 Countdown D{level}",
+            "#6de0a3",
+            "x",
+            f"D{level}",
+        )
+
+    for level in combo_levels:
+        sell_offset = 1.045 + (0.006 if level == 13 else (level - 7) * 0.006)
+        buy_offset = 0.955 - (0.006 if level == 13 else (level - 7) * 0.006)
+        add_marker(
+            fig,
+            df,
+            df["td_sell_combo"] == level,
+            marker_y_sell * sell_offset,
+            f"고점 후보 Combo C{level}",
+            "#f1bd4b",
+            "diamond",
+            f"C{level}",
+        )
+        add_marker(
+            fig,
+            df,
+            df["td_buy_combo"] == level,
+            marker_y_buy * buy_offset,
+            f"저점 후보 Combo C{level}",
+            "#48b7ff",
+            "diamond",
+            f"C{level}",
+        )
+
+
 def add_marker(
     fig: go.Figure,
     df: pd.DataFrame,
@@ -428,7 +569,7 @@ def add_marker(
             y=y_values.loc[points.index],
             mode="markers+text",
             text=[text] * len(points),
-            textposition="top center" if "Sell" in name else "bottom center",
+            textposition="top center" if ("Sell" in name or "고점" in name) else "bottom center",
             name=name,
             marker=dict(size=12, color=color, symbol=symbol, line=dict(width=1, color="#0b0f14")),
             textfont=dict(size=10, color=color),
@@ -453,7 +594,15 @@ def signal_table(df: pd.DataFrame, limit: int = 80) -> pd.DataFrame:
     signals["close"] = signals["close"].map(format_price)
     signals["mfi"] = signals["mfi"].map(lambda value: f"{value:.1f}" if pd.notna(value) else "-")
     signals["bb_width"] = signals["bb_width"].map(lambda value: f"{value:.2f}" if pd.notna(value) else "-")
-    return signals
+    return signals.rename(
+        columns={
+            "signal_zone": "zone",
+            "signal_side": "detail",
+            "signal_strength": "strength",
+            "top_exhaustion_score": "top_score",
+            "bottom_exhaustion_score": "bottom_score",
+        }
+    )
 
 
 def run_scanner(tickers: list[str], period: str, interval: str, auto_adjust: bool) -> pd.DataFrame:
@@ -468,10 +617,11 @@ def run_scanner(tickers: list[str], period: str, interval: str, auto_adjust: boo
                     "ticker": ticker,
                     "close": format_price(summary["close"]),
                     "change_%": f"{pct_change(frame):+.2f}" if math.isfinite(pct_change(frame)) else "-",
-                    "signal": summary["signal_side"],
+                    "zone": summary["signal_zone"],
+                    "detail": summary["signal_side"],
                     "strength": summary["signal_strength"],
-                    "bear_score": summary["bearish_exhaustion_score"],
-                    "bull_score": summary["bullish_exhaustion_score"],
+                    "top_score": summary["top_exhaustion_score"],
+                    "bottom_score": summary["bottom_exhaustion_score"],
                     "sell_setup": summary.get("td_sell_setup", 0),
                     "buy_setup": summary.get("td_buy_setup", 0),
                     "sell_cd": summary.get("td_sell_countdown", 0),
@@ -481,6 +631,7 @@ def run_scanner(tickers: list[str], period: str, interval: str, auto_adjust: boo
                     "last_signal": format_date(summary["last_signal_at"]),
                     "source": source,
                     "status": "fallback" if warning else "ok",
+                    "_priority": max(summary["top_exhaustion_score"], summary["bottom_exhaustion_score"]),
                 }
             )
         except Exception as exc:
@@ -489,10 +640,11 @@ def run_scanner(tickers: list[str], period: str, interval: str, auto_adjust: boo
                     "ticker": ticker,
                     "close": "-",
                     "change_%": "-",
-                    "signal": "데이터 실패",
+                    "zone": "데이터 실패",
+                    "detail": "데이터 실패",
                     "strength": "없음",
-                    "bear_score": 0,
-                    "bull_score": 0,
+                    "top_score": 0,
+                    "bottom_score": 0,
                     "sell_setup": 0,
                     "buy_setup": 0,
                     "sell_cd": 0,
@@ -502,11 +654,13 @@ def run_scanner(tickers: list[str], period: str, interval: str, auto_adjust: boo
                     "last_signal": "-",
                     "source": "-",
                     "status": str(exc)[:120],
+                    "_priority": 0,
                 }
             )
     table = pd.DataFrame(rows)
     if not table.empty:
-        table = table.sort_values(["strength", "bear_score", "bull_score"], ascending=[True, False, False])
+        table = table.sort_values(["_priority", "top_score", "bottom_score"], ascending=[False, False, False])
+        table = table.drop(columns=["_priority"])
     return table
 
 
@@ -574,6 +728,7 @@ def main() -> None:
     if warning:
         st.warning(warning)
     render_metrics(frame, indicators, summary, source)
+    render_reading_guide()
 
     if active_view == "신호 로그":
         st.markdown("<div class='section-label'>Signal history</div>", unsafe_allow_html=True)

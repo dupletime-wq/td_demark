@@ -5,7 +5,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from td_indicators import compute_all_indicators
+from td_indicators import build_signal_summary, compute_all_indicators
 
 
 def make_ohlcv(close: np.ndarray) -> pd.DataFrame:
@@ -25,6 +25,7 @@ def make_ohlcv(close: np.ndarray) -> pd.DataFrame:
 def test_td_sell_setup_and_countdowns_reach_9_and_13() -> None:
     close = np.arange(10.0, 80.0, 2.0)
     result = compute_all_indicators(make_ohlcv(close))
+    summary = build_signal_summary(result)
 
     first_setup_9 = result.index[result["td_sell_setup"].eq(9)][0]
 
@@ -32,11 +33,14 @@ def test_td_sell_setup_and_countdowns_reach_9_and_13() -> None:
     assert result["td_buy_setup"].max() == 0
     assert result["td_sell_countdown"].max() == 13
     assert result["td_sell_combo"].max() == 13
+    assert result["top_exhaustion_score"].max() > 0
+    assert summary["top_exhaustion_score"] >= summary["bottom_exhaustion_score"]
 
 
 def test_td_buy_setup_and_countdowns_reach_9_and_13() -> None:
     close = np.arange(100.0, 30.0, -2.0)
     result = compute_all_indicators(make_ohlcv(close))
+    summary = build_signal_summary(result)
 
     first_setup_9 = result.index[result["td_buy_setup"].eq(9)][0]
 
@@ -44,6 +48,8 @@ def test_td_buy_setup_and_countdowns_reach_9_and_13() -> None:
     assert result["td_sell_setup"].max() == 0
     assert result["td_buy_countdown"].max() == 13
     assert result["td_buy_combo"].max() == 13
+    assert result["bottom_exhaustion_score"].max() > 0
+    assert summary["bottom_exhaustion_score"] >= summary["top_exhaustion_score"]
 
 
 def test_indicators_tolerate_short_data_nan_and_zero_volume() -> None:

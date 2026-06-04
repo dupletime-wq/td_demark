@@ -387,15 +387,28 @@ def add_signal_scores(df: pd.DataFrame) -> None:
     )
     df["bearish_exhaustion_score"] = sell_score.astype("int16")
     df["bullish_exhaustion_score"] = buy_score.astype("int16")
+    df["top_exhaustion_score"] = df["bearish_exhaustion_score"]
+    df["bottom_exhaustion_score"] = df["bullish_exhaustion_score"]
     df["exhaustion_score"] = sell_score - buy_score
+    df["signal_zone"] = np.select(
+        [
+            sell_score > buy_score,
+            buy_score > sell_score,
+        ],
+        [
+            "고점 후보",
+            "저점 후보",
+        ],
+        default="중립",
+    )
     df["signal_side"] = np.select(
         [
             sell_score > buy_score,
             buy_score > sell_score,
         ],
         [
-            "상승 추세 소진",
-            "하락 추세 소진",
+            "상승 추세 소진 -> 고점 후보",
+            "하락 추세 소진 -> 저점 후보",
         ],
         default="중립",
     )
@@ -420,9 +433,12 @@ def build_signal_summary(df: pd.DataFrame) -> dict[str, object]:
         return {
             "close": np.nan,
             "signal_side": "데이터 없음",
+            "signal_zone": "데이터 없음",
             "signal_strength": "없음",
             "bearish_exhaustion_score": 0,
             "bullish_exhaustion_score": 0,
+            "top_exhaustion_score": 0,
+            "bottom_exhaustion_score": 0,
             "last_signal_at": None,
         }
 
@@ -441,9 +457,12 @@ def build_signal_summary(df: pd.DataFrame) -> dict[str, object]:
     return {
         "close": float(latest["close"]) if pd.notna(latest["close"]) else np.nan,
         "signal_side": str(latest["signal_side"]),
+        "signal_zone": str(latest["signal_zone"]),
         "signal_strength": str(latest["signal_strength"]),
         "bearish_exhaustion_score": int(latest["bearish_exhaustion_score"]),
         "bullish_exhaustion_score": int(latest["bullish_exhaustion_score"]),
+        "top_exhaustion_score": int(latest["top_exhaustion_score"]),
+        "bottom_exhaustion_score": int(latest["bottom_exhaustion_score"]),
         "td_sell_setup": int(latest["td_sell_setup"]),
         "td_buy_setup": int(latest["td_buy_setup"]),
         "td_sell_countdown": int(latest["td_sell_countdown"]),
