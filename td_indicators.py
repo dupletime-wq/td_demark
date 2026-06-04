@@ -363,9 +363,20 @@ def pivot_divergence(
 
 
 def add_signal_scores(df: pd.DataFrame) -> None:
+    sell_setup_event = first_setup_event(df["td_sell_setup"])
+    buy_setup_event = first_setup_event(df["td_buy_setup"])
+    sell_td_13 = (df["td_sell_countdown"] == 13) | (df["td_sell_combo"] == 13)
+    buy_td_13 = (df["td_buy_countdown"] == 13) | (df["td_buy_combo"] == 13)
+    sell_td_core = sell_setup_event | sell_td_13
+    buy_td_core = buy_setup_event | buy_td_13
+    sell_mfi = df["mfi_bearish_divergence"] | df["td_camouflage_sell"]
+    buy_mfi = df["mfi_bullish_divergence"] | df["td_camouflage_buy"]
+    sell_band = df["bb_sell_reentry"] | df["starc_sell_reentry"]
+    buy_band = df["bb_buy_reentry"] | df["starc_buy_reentry"]
+
     sell_score = (
-        (df["td_sell_setup"] == 9).astype(int)
-        + (df["td_sell_perfected"]).astype(int)
+        2 * sell_setup_event.astype(int)
+        + (df["td_sell_perfected"] & sell_setup_event).astype(int)
         + 3 * (df["td_sell_countdown"] == 13).astype(int)
         + 4 * (df["td_sell_combo"] == 13).astype(int)
         + 2 * df["mfi_bearish_divergence"].astype(int)
@@ -375,8 +386,8 @@ def add_signal_scores(df: pd.DataFrame) -> None:
         + df["td_camouflage_sell"].astype(int)
     )
     buy_score = (
-        (df["td_buy_setup"] == 9).astype(int)
-        + (df["td_buy_perfected"]).astype(int)
+        2 * buy_setup_event.astype(int)
+        + (df["td_buy_perfected"] & buy_setup_event).astype(int)
         + 3 * (df["td_buy_countdown"] == 13).astype(int)
         + 4 * (df["td_buy_combo"] == 13).astype(int)
         + 2 * df["mfi_bullish_divergence"].astype(int)
@@ -390,6 +401,51 @@ def add_signal_scores(df: pd.DataFrame) -> None:
     df["top_exhaustion_score"] = df["bearish_exhaustion_score"]
     df["bottom_exhaustion_score"] = df["bullish_exhaustion_score"]
     df["exhaustion_score"] = sell_score - buy_score
+    df["top_pressure"] = compute_pressure(
+        setup=df["td_sell_setup"],
+        countdown=df["td_sell_countdown"],
+        combo=df["td_sell_combo"],
+        mfi=sell_mfi,
+        band=sell_band,
+        extreme=df["starc_sell_extreme"],
+    )
+    df["bottom_pressure"] = compute_pressure(
+        setup=df["td_buy_setup"],
+        countdown=df["td_buy_countdown"],
+        combo=df["td_buy_combo"],
+        mfi=buy_mfi,
+        band=buy_band,
+        extreme=df["starc_buy_extreme"],
+    )
+
+    top_has_confirmation = sell_mfi | sell_band
+    bottom_has_confirmation = buy_mfi | buy_band
+    top_display = ((sell_score >= 3) & sell_td_core & top_has_confirmation) | sell_td_13
+    bottom_display = ((buy_score >= 3) & buy_td_core & bottom_has_confirmation) | buy_td_13
+    df["top_display_signal"] = top_display.fillna(False)
+    df["bottom_display_signal"] = bottom_display.fillna(False)
+    df["display_signal"] = df["top_display_signal"] | df["bottom_display_signal"]
+    df["top_signal_event"] = build_event_labels(
+        setup_event=sell_setup_event,
+        countdown=df["td_sell_countdown"],
+        combo=df["td_sell_combo"],
+        mfi=sell_mfi,
+        band=sell_band,
+        display=df["top_display_signal"],
+        prefix="Top",
+    )
+    df["bottom_signal_event"] = build_event_labels(
+        setup_event=buy_setup_event,
+        countdown=df["td_buy_countdown"],
+        combo=df["td_buy_combo"],
+        mfi=buy_mfi,
+        band=buy_band,
+        display=df["bottom_display_signal"],
+        prefix="Bottom",
+    )
+    df["top_signal_quality"] = score_quality(sell_score, df["top_display_signal"])
+    df["bottom_signal_quality"] = score_quality(buy_score, df["bottom_display_signal"])
+
     df["signal_zone"] = np.select(
         [
             sell_score > buy_score,
@@ -426,6 +482,94 @@ def add_signal_scores(df: pd.DataFrame) -> None:
         ],
         default="없음",
     )
+    top_active = df["top_display_signal"] & (sell_score >= buy_score)
+    bottom_active = df["bottom_display_signal"] & (buy_score > sell_score)
+    df["signal_event"] = np.select(
+        [top_active, bottom_active, df["top_display_signal"], df["bottom_display_signal"]],
+        [df["top_signal_event"], df["bottom_signal_event"], df["top_signal_event"], df["bottom_signal_event"]],
+        default="",
+    )
+    df["signal_quality"] = np.select(
+        [top_active, bottom_active, df["top_display_signal"], df["bottom_display_signal"]],
+        [df["top_signal_quality"], df["bottom_signal_quality"], df["top_signal_quality"], df["bottom_signal_quality"]],
+        default="",
+    )
+
+
+def first_setup_event(series: pd.Series) -> pd.Series:
+    return (series == 9) & (series.shift(1).fillna(0) != 9)
+
+
+def compute_pressure(
+    setup: pd.Series,
+    countdown: pd.Series,
+    combo: pd.Series,
+    mfi: pd.Series,
+    band: pd.Series,
+    extreme: pd.Series,
+) -> pd.Series:
+    setup_part = setup.astype(float).clip(0, 9) / 9.0 * 35.0
+    countdown_part = countdown.astype(float).clip(0, 13) / 13.0 * 65.0
+    combo_part = combo.astype(float).clip(0, 13) / 13.0 * 75.0
+    base = pd.concat([setup_part, countdown_part, combo_part], axis=1).max(axis=1).rolling(5, min_periods=1).max()
+    confirmation = 12.0 * mfi.astype(float) + 12.0 * band.astype(float) + 6.0 * extreme.astype(float)
+    return (base + confirmation).clip(0, 100).astype(float)
+
+
+def score_quality(score: pd.Series, display: pd.Series) -> pd.Series:
+    return pd.Series(
+        np.select(
+            [
+                display & (score >= 6),
+                display & (score >= 3),
+                display,
+            ],
+            [
+                "강함",
+                "주의",
+                "관찰",
+            ],
+            default="",
+        ),
+        index=score.index,
+    )
+
+
+def build_event_labels(
+    setup_event: pd.Series,
+    countdown: pd.Series,
+    combo: pd.Series,
+    mfi: pd.Series,
+    band: pd.Series,
+    display: pd.Series,
+    prefix: str,
+) -> pd.Series:
+    labels: list[str] = []
+    for setup_ok, countdown_value, combo_value, mfi_ok, band_ok, display_ok in zip(
+        setup_event.to_numpy(dtype=bool),
+        countdown.to_numpy(dtype=np.int16),
+        combo.to_numpy(dtype=np.int16),
+        mfi.to_numpy(dtype=bool),
+        band.to_numpy(dtype=bool),
+        display.to_numpy(dtype=bool),
+    ):
+        if not display_ok:
+            labels.append("")
+            continue
+
+        parts: list[str] = []
+        if combo_value == 13:
+            parts.append("Combo13")
+        if countdown_value == 13:
+            parts.append("Countdown13")
+        if setup_ok:
+            parts.append("Setup9")
+        if mfi_ok:
+            parts.append("MFI")
+        if band_ok:
+            parts.append("Band")
+        labels.append(f"{prefix}: " + "+".join(parts) if parts else prefix)
+    return pd.Series(labels, index=display.index)
 
 
 def build_signal_summary(df: pd.DataFrame) -> dict[str, object]:
@@ -435,22 +579,20 @@ def build_signal_summary(df: pd.DataFrame) -> dict[str, object]:
             "signal_side": "데이터 없음",
             "signal_zone": "데이터 없음",
             "signal_strength": "없음",
+            "signal_event": "",
+            "signal_quality": "",
             "bearish_exhaustion_score": 0,
             "bullish_exhaustion_score": 0,
             "top_exhaustion_score": 0,
             "bottom_exhaustion_score": 0,
+            "top_pressure": 0.0,
+            "bottom_pressure": 0.0,
+            "display_signal": False,
             "last_signal_at": None,
         }
 
     latest = df.iloc[-1]
-    signal_mask = (
-        (df["bearish_exhaustion_score"] > 0)
-        | (df["bullish_exhaustion_score"] > 0)
-        | (df["td_sell_countdown"] == 13)
-        | (df["td_buy_countdown"] == 13)
-        | (df["td_sell_combo"] == 13)
-        | (df["td_buy_combo"] == 13)
-    )
+    signal_mask = df["display_signal"].astype(bool)
     signal_rows = df.loc[signal_mask]
     last_signal_at = signal_rows.index[-1] if not signal_rows.empty else None
 
@@ -459,10 +601,15 @@ def build_signal_summary(df: pd.DataFrame) -> dict[str, object]:
         "signal_side": str(latest["signal_side"]),
         "signal_zone": str(latest["signal_zone"]),
         "signal_strength": str(latest["signal_strength"]),
+        "signal_event": str(latest["signal_event"]),
+        "signal_quality": str(latest["signal_quality"]),
         "bearish_exhaustion_score": int(latest["bearish_exhaustion_score"]),
         "bullish_exhaustion_score": int(latest["bullish_exhaustion_score"]),
         "top_exhaustion_score": int(latest["top_exhaustion_score"]),
         "bottom_exhaustion_score": int(latest["bottom_exhaustion_score"]),
+        "top_pressure": float(latest["top_pressure"]) if pd.notna(latest["top_pressure"]) else 0.0,
+        "bottom_pressure": float(latest["bottom_pressure"]) if pd.notna(latest["bottom_pressure"]) else 0.0,
+        "display_signal": bool(latest["display_signal"]),
         "td_sell_setup": int(latest["td_sell_setup"]),
         "td_buy_setup": int(latest["td_buy_setup"]),
         "td_sell_countdown": int(latest["td_sell_countdown"]),
@@ -470,4 +617,63 @@ def build_signal_summary(df: pd.DataFrame) -> dict[str, object]:
         "td_sell_combo": int(latest["td_sell_combo"]),
         "td_buy_combo": int(latest["td_buy_combo"]),
         "last_signal_at": last_signal_at,
+    }
+
+
+def build_recent_signal_summary(df: pd.DataFrame, lookback: int = 20) -> dict[str, object]:
+    latest_summary = build_signal_summary(df)
+    if df.empty:
+        return latest_summary | {
+            "qualified_at": None,
+            "days_since_signal": None,
+            "reason": "",
+            "priority_score": 0,
+        }
+
+    recent = df.tail(lookback).copy()
+    qualified = recent.loc[recent["display_signal"].astype(bool)]
+    if qualified.empty:
+        return latest_summary | {
+            "qualified_at": None,
+            "days_since_signal": None,
+            "reason": "최근 강한 합류 신호 없음",
+            "priority_score": 0,
+        }
+
+    qualified = qualified.assign(
+        _priority_score=np.maximum(
+            qualified["top_exhaustion_score"].to_numpy(dtype=float),
+            qualified["bottom_exhaustion_score"].to_numpy(dtype=float),
+        )
+    )
+    best = qualified.sort_values(["_priority_score"], ascending=False).iloc[0]
+    latest_index = pd.Timestamp(df.index[-1])
+    signal_index = pd.Timestamp(best.name)
+    days_since = max((latest_index - signal_index).days, 0)
+
+    return {
+        "close": float(df.iloc[-1]["close"]) if pd.notna(df.iloc[-1]["close"]) else np.nan,
+        "signal_side": str(best["signal_side"]),
+        "signal_zone": str(best["signal_zone"]),
+        "signal_strength": str(best["signal_strength"]),
+        "signal_event": str(best["signal_event"]),
+        "signal_quality": str(best["signal_quality"]),
+        "bearish_exhaustion_score": int(best["bearish_exhaustion_score"]),
+        "bullish_exhaustion_score": int(best["bullish_exhaustion_score"]),
+        "top_exhaustion_score": int(best["top_exhaustion_score"]),
+        "bottom_exhaustion_score": int(best["bottom_exhaustion_score"]),
+        "top_pressure": float(df.iloc[-1]["top_pressure"]) if pd.notna(df.iloc[-1]["top_pressure"]) else 0.0,
+        "bottom_pressure": float(df.iloc[-1]["bottom_pressure"]) if pd.notna(df.iloc[-1]["bottom_pressure"]) else 0.0,
+        "display_signal": bool(best["display_signal"]),
+        "td_sell_setup": int(df.iloc[-1]["td_sell_setup"]),
+        "td_buy_setup": int(df.iloc[-1]["td_buy_setup"]),
+        "td_sell_countdown": int(df.iloc[-1]["td_sell_countdown"]),
+        "td_buy_countdown": int(df.iloc[-1]["td_buy_countdown"]),
+        "td_sell_combo": int(df.iloc[-1]["td_sell_combo"]),
+        "td_buy_combo": int(df.iloc[-1]["td_buy_combo"]),
+        "last_signal_at": latest_summary["last_signal_at"],
+        "qualified_at": best.name,
+        "days_since_signal": days_since,
+        "reason": str(best["signal_event"]),
+        "priority_score": int(best["_priority_score"]),
     }

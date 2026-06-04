@@ -9,19 +9,28 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from data_provider import DataProviderError, download_price_data
-from td_indicators import build_signal_summary, compute_all_indicators
+from td_indicators import build_recent_signal_summary, build_signal_summary, compute_all_indicators
 
 
 DEFAULT_WATCHLIST = "SPY, QQQ, AAPL, MSFT, NVDA, TSLA, BTC-USD, ETH-USD"
 PERIOD_OPTIONS = ["3mo", "6mo", "1y", "2y", "5y", "10y"]
 INTERVAL_OPTIONS = ["1d", "1wk", "1mo"]
+DISPLAY_MODES = ["Precision", "Balanced", "Debug"]
+SCANNER_LOOKBACK = 20
+MAX_CHART_ROWS = 900
+MAX_SIGNAL_MARKERS = 40
 SIGNAL_COLUMNS = [
     "close",
     "signal_zone",
     "signal_side",
+    "signal_quality",
+    "signal_event",
     "signal_strength",
+    "display_signal",
     "top_exhaustion_score",
     "bottom_exhaustion_score",
+    "top_pressure",
+    "bottom_pressure",
     "td_sell_setup",
     "td_buy_setup",
     "td_sell_countdown",
@@ -310,22 +319,22 @@ def render_reading_guide() -> None:
             <div class="guide-card top">
                 <div class="kicker">Top setup</div>
                 <div class="headline">고점 후보</div>
-                <div class="body">빨간 계열 마커와 Top Score는 상승 추세가 과열되어 고점 반전 후보가 생겼다는 뜻입니다. S7/S8은 예열, S9는 setup 완성, D13/C13은 소진 완성 후보입니다.</div>
+                <div class="body">빨간 핵심 마커와 Top Score는 상승 추세가 과열되어 고점 반전 후보가 생겼다는 뜻입니다. 기본 모드는 TD와 MFI/밴드 합류 신호만 표시합니다.</div>
             </div>
             <div class="guide-card bottom">
                 <div class="kicker">Bottom setup</div>
                 <div class="headline">저점 후보</div>
-                <div class="body">초록/시안 계열 마커와 Bottom Score는 하락 추세가 소진되어 저점 반등 후보가 생겼다는 뜻입니다. B7/B8은 예열, B9는 setup 완성, D13/C13은 소진 완성 후보입니다.</div>
+                <div class="body">초록/시안 핵심 마커와 Bottom Score는 하락 추세가 소진되어 저점 반등 후보가 생겼다는 뜻입니다. 기본 모드는 단독 7/8 경보를 차트에 표시하지 않습니다.</div>
             </div>
             <div class="guide-card">
-                <div class="kicker">Levels</div>
-                <div class="headline">7 · 8 · 9 · 13</div>
-                <div class="body">7/8은 조기 경보, 9는 setup 완료, 13은 countdown 또는 combo 완료입니다. 13만 기다리면 늦을 수 있어 진행 숫자를 모두 표시합니다.</div>
+                <div class="kicker">Pressure</div>
+                <div class="headline">리본 먼저 보기</div>
+                <div class="body">빨간 리본은 고점 압력, 초록 리본은 저점 압력입니다. 리본이 높아지고 핵심 마커가 찍히면 후보 신뢰도가 올라갑니다.</div>
             </div>
             <div class="guide-card">
-                <div class="kicker">Confirmation</div>
-                <div class="headline">단독 신호 금지</div>
-                <div class="body">점수 1-2는 관찰, 3-5는 주의, 6 이상은 강함입니다. MFI divergence, 밴드 재진입, 직전 지지/저항과 함께 확인합니다.</div>
+                <div class="kicker">Display mode</div>
+                <div class="headline">Precision · Balanced · Debug</div>
+                <div class="body">Precision은 강한 합류 신호만, Balanced는 9/13과 확인된 7/8, Debug는 모든 7/8/9/13 진행을 보여줍니다.</div>
             </div>
         </div>
         """,
@@ -339,13 +348,15 @@ def build_chart(
     show_bollinger: bool,
     show_starc: bool,
     show_mfi: bool,
+    display_mode: str,
 ) -> go.Figure:
+    df = chart_frame(df)
     fig = make_subplots(
         rows=3,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.035,
-        row_heights=[0.62, 0.2, 0.18],
+        row_heights=[0.64, 0.22, 0.14],
         specs=[[{}], [{}], [{}]],
     )
 
@@ -376,55 +387,59 @@ def build_chart(
 
     marker_y_sell = df["high"] * 1.01
     marker_y_buy = df["low"] * 0.99
-    add_td_level_markers(fig, df, marker_y_sell, marker_y_buy)
-    top_filter = df["mfi_bearish_divergence"] | df["bb_sell_reentry"] | df["starc_sell_reentry"] | df["td_camouflage_sell"]
-    bottom_filter = df["mfi_bullish_divergence"] | df["bb_buy_reentry"] | df["starc_buy_reentry"] | df["td_camouflage_buy"]
-    add_marker(fig, df, top_filter, marker_y_sell * 1.025, "고점 후보 보조 신호", "#ff5c70", "circle", "TOP")
-    add_marker(fig, df, bottom_filter, marker_y_buy * 0.975, "저점 후보 보조 신호", "#48b7ff", "circle", "LOW")
-
-    if show_mfi:
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df["mfi"], name="MFI", mode="lines", line=dict(color="#48b7ff", width=1.7)),
-            row=2,
-            col=1,
-        )
-        fig.add_hline(y=80, line_dash="dot", line_color="rgba(255,92,112,0.55)", row=2, col=1)
-        fig.add_hline(y=20, line_dash="dot", line_color="rgba(65,211,138,0.55)", row=2, col=1)
-    else:
-        fig.add_trace(
-            go.Scatter(x=df.index, y=df["exhaustion_score"], name="Score", mode="lines", line=dict(color="#48b7ff")),
-            row=2,
-            col=1,
-        )
+    add_mode_markers(fig, df, marker_y_sell, marker_y_buy, display_mode)
 
     fig.add_trace(
-        go.Bar(
+        go.Scatter(
             x=df.index,
-            y=df["exhaustion_score"],
-            name="Exhaustion Score",
-            marker_color=[
-                "#ff5c70" if value > 0 else "#41d38a" if value < 0 else "rgba(145,162,178,0.28)"
-                for value in df["exhaustion_score"].fillna(0)
-            ],
+            y=df["top_pressure"],
+            name="Top Pressure",
+            mode="lines",
+            fill="tozeroy",
+            line=dict(color="#ff5c70", width=1.5),
+            fillcolor="rgba(255, 92, 112, 0.20)",
         ),
-        row=3,
+        row=2,
         col=1,
     )
     fig.add_trace(
         go.Scatter(
             x=df.index,
-            y=df["bb_width"],
-            name="BB Width",
+            y=-df["bottom_pressure"],
+            name="Bottom Pressure",
             mode="lines",
-            line=dict(color="rgba(241,189,75,0.82)", width=1.4),
-            yaxis="y3",
+            fill="tozeroy",
+            line=dict(color="#41d38a", width=1.5),
+            fillcolor="rgba(65, 211, 138, 0.20)",
         ),
-        row=3,
+        row=2,
         col=1,
     )
+    fig.add_hline(y=0, line_color="rgba(188,205,219,0.16)", row=2, col=1)
+
+    if show_mfi:
+        fig.add_trace(
+            go.Scatter(x=df.index, y=df["mfi"], name="MFI", mode="lines", line=dict(color="#48b7ff", width=1.5)),
+            row=3,
+            col=1,
+        )
+        fig.add_hline(y=80, line_dash="dot", line_color="rgba(255,92,112,0.55)", row=3, col=1)
+        fig.add_hline(y=20, line_dash="dot", line_color="rgba(65,211,138,0.55)", row=3, col=1)
+    else:
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["bb_width"],
+                name="BB Width",
+                mode="lines",
+                line=dict(color="rgba(241,189,75,0.82)", width=1.4),
+            ),
+            row=3,
+            col=1,
+        )
 
     fig.update_layout(
-        height=760,
+        height=720,
         margin=dict(l=28, r=24, t=26, b=24),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="#0d141c",
@@ -436,9 +451,136 @@ def build_chart(
     fig.update_xaxes(showgrid=False, zeroline=False)
     fig.update_yaxes(gridcolor="rgba(188,205,219,0.12)", zerolinecolor="rgba(188,205,219,0.12)")
     fig.update_yaxes(title_text="Price", row=1, col=1)
-    fig.update_yaxes(title_text="MFI" if show_mfi else "Score", row=2, col=1, range=[0, 100] if show_mfi else None)
-    fig.update_yaxes(title_text="Score", row=3, col=1)
+    fig.update_yaxes(title_text="Pressure", row=2, col=1, range=[-105, 105])
+    fig.update_yaxes(title_text="MFI" if show_mfi else "BB Width", row=3, col=1, range=[0, 100] if show_mfi else None)
     return fig
+
+
+def chart_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if len(df) <= MAX_CHART_ROWS:
+        return df.copy()
+    return df.tail(MAX_CHART_ROWS).copy()
+
+
+def add_mode_markers(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    marker_y_sell: pd.Series,
+    marker_y_buy: pd.Series,
+    display_mode: str,
+) -> None:
+    if display_mode == "Debug":
+        add_td_level_markers(fig, df, marker_y_sell, marker_y_buy)
+        return
+
+    top_mask, bottom_mask = mode_signal_masks(df, display_mode)
+    add_signal_marker_trace(
+        fig=fig,
+        df=df,
+        mask=top_mask,
+        y_values=marker_y_sell * 1.015,
+        event_column="top_signal_event",
+        name="고점 후보 핵심",
+        color="#ff5c70",
+        symbol="triangle-down",
+        textposition="top center",
+    )
+    add_signal_marker_trace(
+        fig=fig,
+        df=df,
+        mask=bottom_mask,
+        y_values=marker_y_buy * 0.985,
+        event_column="bottom_signal_event",
+        name="저점 후보 핵심",
+        color="#41d38a",
+        symbol="triangle-up",
+        textposition="bottom center",
+    )
+
+
+def mode_signal_masks(df: pd.DataFrame, display_mode: str) -> tuple[pd.Series, pd.Series]:
+    top_precision = df["top_display_signal"].astype(bool)
+    bottom_precision = df["bottom_display_signal"].astype(bool)
+    if display_mode == "Precision":
+        return top_precision, bottom_precision
+
+    top_confirmation = (
+        df["mfi_bearish_divergence"]
+        | df["bb_sell_reentry"]
+        | df["starc_sell_reentry"]
+        | df["td_camouflage_sell"]
+    )
+    bottom_confirmation = (
+        df["mfi_bullish_divergence"]
+        | df["bb_buy_reentry"]
+        | df["starc_buy_reentry"]
+        | df["td_camouflage_buy"]
+    )
+    top_balanced = (
+        top_precision
+        | first_completion(df["td_sell_setup"])
+        | (df["td_sell_countdown"] == 13)
+        | (df["td_sell_combo"] == 13)
+        | (df["td_sell_setup"].isin([7, 8]) & top_confirmation)
+    )
+    bottom_balanced = (
+        bottom_precision
+        | first_completion(df["td_buy_setup"])
+        | (df["td_buy_countdown"] == 13)
+        | (df["td_buy_combo"] == 13)
+        | (df["td_buy_setup"].isin([7, 8]) & bottom_confirmation)
+    )
+    return top_balanced.fillna(False), bottom_balanced.fillna(False)
+
+
+def add_signal_marker_trace(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    mask: Iterable[bool],
+    y_values: pd.Series,
+    event_column: str,
+    name: str,
+    color: str,
+    symbol: str,
+    textposition: str,
+) -> None:
+    clean_mask = pd.Series(mask, index=df.index).fillna(False)
+    points = df.loc[clean_mask].tail(MAX_SIGNAL_MARKERS)
+    if points.empty:
+        return
+    labels = [compact_event_label(value, name) for value in points[event_column]]
+    fig.add_trace(
+        go.Scatter(
+            x=points.index,
+            y=y_values.loc[points.index],
+            mode="markers+text",
+            text=labels,
+            textposition=textposition,
+            name=name,
+            marker=dict(size=13, color=color, symbol=symbol, line=dict(width=1, color="#0b0f14")),
+            textfont=dict(size=10, color=color),
+            hovertemplate="%{x}<br>%{text}<extra>" + name + "</extra>",
+        ),
+        row=1,
+        col=1,
+    )
+
+
+def compact_event_label(value: object, fallback: str) -> str:
+    text = str(value or "")
+    if "Combo13" in text:
+        return "C13"
+    if "Countdown13" in text:
+        return "D13"
+    if "Setup9" in text:
+        return "S9" if "고점" in fallback else "B9"
+    if "MFI" in text and "Band" in text:
+        return "M+B"
+    if "MFI" in text:
+        return "MFI"
+    if "Band" in text:
+        return "BAND"
+    return "TOP" if "고점" in fallback else "LOW"
 
 
 def add_line(fig: go.Figure, df: pd.DataFrame, column: str, name: str, color: str, row: int) -> None:
@@ -560,7 +702,7 @@ def add_marker(
     text: str,
 ) -> None:
     clean_mask = pd.Series(mask, index=df.index).fillna(False)
-    points = df.loc[clean_mask]
+    points = df.loc[clean_mask].tail(MAX_SIGNAL_MARKERS)
     if points.empty:
         return
     fig.add_trace(
@@ -579,14 +721,19 @@ def add_marker(
     )
 
 
-def signal_table(df: pd.DataFrame, limit: int = 80) -> pd.DataFrame:
-    signal_mask = (
-        (df["signal_strength"] != "없음")
-        | (df["td_sell_countdown"] == 13)
-        | (df["td_buy_countdown"] == 13)
-        | (df["td_sell_combo"] == 13)
-        | (df["td_buy_combo"] == 13)
-    )
+def signal_table(df: pd.DataFrame, limit: int = 80, raw: bool = False) -> pd.DataFrame:
+    if raw:
+        signal_mask = (
+            df["display_signal"].astype(bool)
+            | df["td_sell_setup"].isin([7, 8, 9])
+            | df["td_buy_setup"].isin([7, 8, 9])
+            | df["td_sell_countdown"].isin([7, 8, 9, 13])
+            | df["td_buy_countdown"].isin([7, 8, 9, 13])
+            | df["td_sell_combo"].isin([7, 8, 9, 13])
+            | df["td_buy_combo"].isin([7, 8, 9, 13])
+        )
+    else:
+        signal_mask = df["display_signal"].astype(bool)
     signals = df.loc[signal_mask, SIGNAL_COLUMNS].tail(limit).copy()
     if signals.empty:
         return pd.DataFrame(columns=["date", *SIGNAL_COLUMNS])
@@ -598,9 +745,13 @@ def signal_table(df: pd.DataFrame, limit: int = 80) -> pd.DataFrame:
         columns={
             "signal_zone": "zone",
             "signal_side": "detail",
+            "signal_quality": "quality",
+            "signal_event": "event",
             "signal_strength": "strength",
             "top_exhaustion_score": "top_score",
             "bottom_exhaustion_score": "bottom_score",
+            "top_pressure": "top_pressure",
+            "bottom_pressure": "bottom_pressure",
         }
     )
 
@@ -611,27 +762,22 @@ def run_scanner(tickers: list[str], period: str, interval: str, auto_adjust: boo
         try:
             frame, source, warning = cached_load_price_data(ticker, period, interval, auto_adjust)
             indicators = cached_compute_indicators(frame)
-            summary = build_signal_summary(indicators)
+            summary = build_recent_signal_summary(indicators, lookback=SCANNER_LOOKBACK)
             rows.append(
                 {
                     "ticker": ticker,
                     "close": format_price(summary["close"]),
                     "change_%": f"{pct_change(frame):+.2f}" if math.isfinite(pct_change(frame)) else "-",
                     "zone": summary["signal_zone"],
-                    "detail": summary["signal_side"],
-                    "strength": summary["signal_strength"],
+                    "quality": summary["signal_quality"] or summary["signal_strength"],
+                    "days_since_signal": summary["days_since_signal"] if summary["days_since_signal"] is not None else "-",
                     "top_score": summary["top_exhaustion_score"],
                     "bottom_score": summary["bottom_exhaustion_score"],
-                    "sell_setup": summary.get("td_sell_setup", 0),
-                    "buy_setup": summary.get("td_buy_setup", 0),
-                    "sell_cd": summary.get("td_sell_countdown", 0),
-                    "buy_cd": summary.get("td_buy_countdown", 0),
-                    "sell_combo": summary.get("td_sell_combo", 0),
-                    "buy_combo": summary.get("td_buy_combo", 0),
-                    "last_signal": format_date(summary["last_signal_at"]),
+                    "reason": summary["reason"],
                     "source": source,
                     "status": "fallback" if warning else "ok",
-                    "_priority": max(summary["top_exhaustion_score"], summary["bottom_exhaustion_score"]),
+                    "_priority": summary["priority_score"],
+                    "_recency": summary["days_since_signal"] if summary["days_since_signal"] is not None else 9999,
                 }
             )
         except Exception as exc:
@@ -641,30 +787,25 @@ def run_scanner(tickers: list[str], period: str, interval: str, auto_adjust: boo
                     "close": "-",
                     "change_%": "-",
                     "zone": "데이터 실패",
-                    "detail": "데이터 실패",
-                    "strength": "없음",
+                    "quality": "없음",
+                    "days_since_signal": "-",
                     "top_score": 0,
                     "bottom_score": 0,
-                    "sell_setup": 0,
-                    "buy_setup": 0,
-                    "sell_cd": 0,
-                    "buy_cd": 0,
-                    "sell_combo": 0,
-                    "buy_combo": 0,
-                    "last_signal": "-",
+                    "reason": "데이터 실패",
                     "source": "-",
                     "status": str(exc)[:120],
                     "_priority": 0,
+                    "_recency": 9999,
                 }
             )
     table = pd.DataFrame(rows)
     if not table.empty:
-        table = table.sort_values(["_priority", "top_score", "bottom_score"], ascending=[False, False, False])
-        table = table.drop(columns=["_priority"])
+        table = table.sort_values(["_priority", "_recency", "top_score", "bottom_score"], ascending=[False, True, False, False])
+        table = table.drop(columns=["_priority", "_recency"])
     return table
 
 
-def sidebar_controls() -> tuple[str, str, str, bool, list[str], bool, bool, bool]:
+def sidebar_controls() -> tuple[str, str, str, bool, list[str], bool, bool, bool, str]:
     if "watchlist_text" not in st.session_state:
         st.session_state.watchlist_text = DEFAULT_WATCHLIST
     if "active_view" not in st.session_state:
@@ -677,6 +818,7 @@ def sidebar_controls() -> tuple[str, str, str, bool, list[str], bool, bool, bool
     auto_adjust = st.sidebar.toggle("Adjusted OHLC", value=True)
 
     st.sidebar.markdown("### Overlays")
+    display_mode = st.sidebar.selectbox("Display Mode", DISPLAY_MODES, index=0)
     show_bollinger = st.sidebar.toggle("Bollinger", value=True)
     show_starc = st.sidebar.toggle("STARC-style", value=True)
     show_mfi = st.sidebar.toggle("MFI Panel", value=True)
@@ -685,12 +827,22 @@ def sidebar_controls() -> tuple[str, str, str, bool, list[str], bool, bool, bool
     watchlist_text = st.sidebar.text_area("Tickers", key="watchlist_text", height=118)
     tickers = parse_watchlist(watchlist_text)
     st.sidebar.caption(f"{len(tickers)} / 25 tickers")
-    return ticker.strip().upper(), period, interval, auto_adjust, tickers, show_bollinger, show_starc, show_mfi
+    return ticker.strip().upper(), period, interval, auto_adjust, tickers, show_bollinger, show_starc, show_mfi, display_mode
 
 
 def main() -> None:
     inject_css()
-    ticker, period, interval, auto_adjust, tickers, show_bollinger, show_starc, show_mfi = sidebar_controls()
+    (
+        ticker,
+        period,
+        interval,
+        auto_adjust,
+        tickers,
+        show_bollinger,
+        show_starc,
+        show_mfi,
+        display_mode,
+    ) = sidebar_controls()
 
     active_view = st.radio(
         "View",
@@ -732,11 +884,11 @@ def main() -> None:
 
     if active_view == "신호 로그":
         st.markdown("<div class='section-label'>Signal history</div>", unsafe_allow_html=True)
-        st.dataframe(signal_table(indicators, limit=160), width="stretch", hide_index=True)
+        st.dataframe(signal_table(indicators, limit=220, raw=True), width="stretch", hide_index=True)
         return
 
     st.markdown("<div class='section-label'>Price and exhaustion map</div>", unsafe_allow_html=True)
-    chart = build_chart(indicators, ticker, show_bollinger, show_starc, show_mfi)
+    chart = build_chart(indicators, ticker, show_bollinger, show_starc, show_mfi, display_mode)
     st.plotly_chart(
         chart,
         width="stretch",
@@ -747,7 +899,7 @@ def main() -> None:
         },
     )
 
-    st.markdown("<div class='section-label'>Recent signals</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-label'>Qualified recent signals</div>", unsafe_allow_html=True)
     st.dataframe(signal_table(indicators), width="stretch", hide_index=True)
 
 
