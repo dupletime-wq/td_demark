@@ -60,24 +60,15 @@ def add_td_setup(df: pd.DataFrame) -> None:
 
     high = df["high"]
     low = df["low"]
-    sell_perfected = (
-        (df["td_sell_setup"] == 9)
-        & (
-            (high >= high.shift(2))
-            | (high >= high.shift(3))
-            | (high.shift(1) >= high.shift(2))
-            | (high.shift(1) >= high.shift(3))
-        )
-    )
-    buy_perfected = (
-        (df["td_buy_setup"] == 9)
-        & (
-            (low <= low.shift(2))
-            | (low <= low.shift(3))
-            | (low.shift(1) <= low.shift(2))
-            | (low.shift(1) <= low.shift(3))
-        )
-    )
+    # Perfection requires the high of bar 8 OR bar 9 to exceed BOTH bar 6 and bar 7
+    # (not just any one of the four pairwise comparisons).
+    bar9_exceeds_both = (high >= high.shift(2)) & (high >= high.shift(3))
+    bar8_exceeds_both = (high.shift(1) >= high.shift(2)) & (high.shift(1) >= high.shift(3))
+    sell_perfected = (df["td_sell_setup"] == 9) & (bar9_exceeds_both | bar8_exceeds_both)
+
+    bar9_below_both = (low <= low.shift(2)) & (low <= low.shift(3))
+    bar8_below_both = (low.shift(1) <= low.shift(2)) & (low.shift(1) <= low.shift(3))
+    buy_perfected = (df["td_buy_setup"] == 9) & (bar9_below_both | bar8_below_both)
     df["td_sell_perfected"] = sell_perfected.fillna(False)
     df["td_buy_perfected"] = buy_perfected.fillna(False)
 
@@ -116,16 +107,33 @@ def sequential_countdown(
     buy = np.zeros(size, dtype=np.int16)
     sell = np.zeros(size, dtype=np.int16)
 
+    # Plain Python lists avoid per-element NumPy scalar boxing/np.isfinite call overhead
+    # in this tight, inherently sequential (state-carrying) loop.
+    close_l = close.tolist()
+    high_finite = np.isfinite(high)
+    low_finite = np.isfinite(low)
+    close_finite = np.isfinite(close).tolist()
+    high_l = high.tolist()
+    low_l = low.tolist()
+    high_finite_l = high_finite.tolist()
+    low_finite_l = low_finite.tolist()
+    buy_setup_l = buy_setup.tolist()
+    sell_setup_l = sell_setup.tolist()
+
     buy_active = False
     sell_active = False
     buy_count = 0
     sell_count = 0
+    previous_sell_setup = 0
+    previous_buy_setup = 0
 
     for i in range(size):
-        previous_sell_setup = sell_setup[i - 1] if i > 0 else 0
-        previous_buy_setup = buy_setup[i - 1] if i > 0 else 0
-        sell_setup_completed = sell_setup[i] == 9 and previous_sell_setup != 9
-        buy_setup_completed = buy_setup[i] == 9 and previous_buy_setup != 9
+        current_sell_setup = sell_setup_l[i]
+        current_buy_setup = buy_setup_l[i]
+        sell_setup_completed = current_sell_setup == 9 and previous_sell_setup != 9
+        buy_setup_completed = current_buy_setup == 9 and previous_buy_setup != 9
+        previous_sell_setup = current_sell_setup
+        previous_buy_setup = current_buy_setup
 
         if sell_setup_completed:
             sell_active = True
@@ -138,17 +146,17 @@ def sequential_countdown(
             buy_count = 0
             sell_count = 0
 
-        if i < 2 or not np.isfinite(close[i]):
+        if i < 2 or not close_finite[i]:
             continue
 
-        if sell_active and np.isfinite(high[i - 2]) and close[i] >= high[i - 2]:
+        if sell_active and high_finite_l[i - 2] and close_l[i] >= high_l[i - 2]:
             sell_count += 1
             sell[i] = sell_count
             if sell_count >= 13:
                 sell_active = False
                 sell_count = 0
 
-        if buy_active and np.isfinite(low[i - 2]) and close[i] <= low[i - 2]:
+        if buy_active and low_finite_l[i - 2] and close_l[i] <= low_l[i - 2]:
             buy_count += 1
             buy[i] = buy_count
             if buy_count >= 13:
@@ -169,55 +177,65 @@ def combo_countdown(
     buy = np.zeros(size, dtype=np.int16)
     sell = np.zeros(size, dtype=np.int16)
 
+    # Same rationale as sequential_countdown: plain Python lists and precomputed
+    # finite-masks remove per-element NumPy overhead from this sequential loop.
+    close_l = close.tolist()
+    high_l = high.tolist()
+    low_l = low.tolist()
+    close_finite_l = np.isfinite(close).tolist()
+    high_finite_l = np.isfinite(high).tolist()
+    low_finite_l = np.isfinite(low).tolist()
+    buy_setup_l = buy_setup.tolist()
+    sell_setup_l = sell_setup.tolist()
+
     buy_count = 0
     sell_count = 0
-    last_buy_close = np.nan
-    last_sell_close = np.nan
+    last_buy_close: float | None = None
+    last_sell_close: float | None = None
 
     for i in range(size):
-        if sell_setup[i] > 0:
+        if sell_setup_l[i] > 0:
             buy_count = 0
-            last_buy_close = np.nan
-        if buy_setup[i] > 0:
+            last_buy_close = None
+        if buy_setup_l[i] > 0:
             sell_count = 0
-            last_sell_close = np.nan
+            last_sell_close = None
 
-        if i < 4 or not np.isfinite(close[i]):
+        if i < 4 or not close_finite_l[i]:
             continue
 
+        close_i = close_l[i]
         sell_ok = (
-            sell_setup[i] > 0
-            and i >= 2
-            and np.isfinite(high[i - 2])
-            and close[i] >= high[i - 2]
-            and np.isfinite(close[i - 1])
-            and close[i] >= close[i - 1]
-            and (not np.isfinite(last_sell_close) or close[i] > last_sell_close)
+            sell_setup_l[i] > 0
+            and high_finite_l[i - 2]
+            and close_i >= high_l[i - 2]
+            and close_finite_l[i - 1]
+            and close_i >= close_l[i - 1]
+            and (last_sell_close is None or close_i > last_sell_close)
         )
         if sell_ok:
             sell_count += 1
             sell[i] = sell_count
-            last_sell_close = close[i]
+            last_sell_close = close_i
             if sell_count >= 13:
                 sell_count = 0
-                last_sell_close = np.nan
+                last_sell_close = None
 
         buy_ok = (
-            buy_setup[i] > 0
-            and i >= 2
-            and np.isfinite(low[i - 2])
-            and close[i] <= low[i - 2]
-            and np.isfinite(close[i - 1])
-            and close[i] <= close[i - 1]
-            and (not np.isfinite(last_buy_close) or close[i] < last_buy_close)
+            buy_setup_l[i] > 0
+            and low_finite_l[i - 2]
+            and close_i <= low_l[i - 2]
+            and close_finite_l[i - 1]
+            and close_i <= close_l[i - 1]
+            and (last_buy_close is None or close_i < last_buy_close)
         )
         if buy_ok:
             buy_count += 1
             buy[i] = buy_count
-            last_buy_close = close[i]
+            last_buy_close = close_i
             if buy_count >= 13:
                 buy_count = 0
-                last_buy_close = np.nan
+                last_buy_close = None
 
     return buy, sell
 
@@ -336,28 +354,37 @@ def pivot_divergence(
     size = high.size
     bearish = np.zeros(size, dtype=bool)
     bullish = np.zeros(size, dtype=bool)
-    high_pivots: list[int] = []
-    low_pivots: list[int] = []
+    if size <= 2 * lookback:
+        return bearish, bullish
 
-    for i in range(lookback, size - lookback):
-        window_high = high[i - lookback : i + lookback + 1]
-        window_low = low[i - lookback : i + lookback + 1]
-        if not np.isfinite(oscillator[i]):
-            continue
+    # A centered rolling max/min (via pandas' O(n) monotonic-window algorithm) replaces
+    # the previous per-row np.nanmax/np.nanmin over a re-sliced window, which was the
+    # dominant cost of this function on longer price histories.
+    window = 2 * lookback + 1
+    rolling_high_max = pd.Series(high).rolling(window, center=True, min_periods=1).max().to_numpy()
+    rolling_low_min = pd.Series(low).rolling(window, center=True, min_periods=1).min().to_numpy()
 
-        if np.isfinite(high[i]) and high[i] == np.nanmax(window_high):
-            if high_pivots:
-                previous = high_pivots[-1]
-                if high[i] > high[previous] and oscillator[i] < oscillator[previous]:
-                    bearish[i] = True
-            high_pivots.append(i)
+    finite_oscillator = np.isfinite(oscillator)
+    is_high_pivot = np.isfinite(high) & finite_oscillator & (high == rolling_high_max)
+    is_low_pivot = np.isfinite(low) & finite_oscillator & (low == rolling_low_min)
+    is_high_pivot[:lookback] = False
+    is_high_pivot[size - lookback :] = False
+    is_low_pivot[:lookback] = False
+    is_low_pivot[size - lookback :] = False
 
-        if np.isfinite(low[i]) and low[i] == np.nanmin(window_low):
-            if low_pivots:
-                previous = low_pivots[-1]
-                if low[i] < low[previous] and oscillator[i] > oscillator[previous]:
-                    bullish[i] = True
-            low_pivots.append(i)
+    high_pivots = np.flatnonzero(is_high_pivot)
+    for pos in range(1, high_pivots.size):
+        i = high_pivots[pos]
+        previous = high_pivots[pos - 1]
+        if high[i] > high[previous] and oscillator[i] < oscillator[previous]:
+            bearish[i] = True
+
+    low_pivots = np.flatnonzero(is_low_pivot)
+    for pos in range(1, low_pivots.size):
+        i = low_pivots[pos]
+        previous = low_pivots[pos - 1]
+        if low[i] < low[previous] and oscillator[i] > oscillator[previous]:
+            bullish[i] = True
 
     return bearish, bullish
 
@@ -508,12 +535,20 @@ def compute_pressure(
     band: pd.Series,
     extreme: pd.Series,
 ) -> pd.Series:
-    setup_part = setup.astype(float).clip(0, 9) / 9.0 * 35.0
-    countdown_part = countdown.astype(float).clip(0, 13) / 13.0 * 65.0
-    combo_part = combo.astype(float).clip(0, 13) / 13.0 * 75.0
-    base = pd.concat([setup_part, countdown_part, combo_part], axis=1).max(axis=1).rolling(5, min_periods=1).max()
-    confirmation = 12.0 * mfi.astype(float) + 12.0 * band.astype(float) + 6.0 * extreme.astype(float)
-    return (base + confirmation).clip(0, 100).astype(float)
+    # NumPy arithmetic replaces the previous per-column pandas Series ops + pd.concat,
+    # which dominated add_signal_scores's runtime (each pandas op re-wraps a Series).
+    setup_part = np.clip(setup.to_numpy(dtype=float), 0, 9) / 9.0 * 35.0
+    countdown_part = np.clip(countdown.to_numpy(dtype=float), 0, 13) / 13.0 * 65.0
+    combo_part = np.clip(combo.to_numpy(dtype=float), 0, 13) / 13.0 * 75.0
+    base = np.maximum(np.maximum(setup_part, countdown_part), combo_part)
+    base = pd.Series(base, index=setup.index).rolling(5, min_periods=1).max().to_numpy()
+    confirmation = (
+        12.0 * mfi.to_numpy(dtype=float)
+        + 12.0 * band.to_numpy(dtype=float)
+        + 6.0 * extreme.to_numpy(dtype=float)
+    )
+    result = np.clip(base + confirmation, 0, 100)
+    return pd.Series(result, index=setup.index)
 
 
 def score_quality(score: pd.Series, display: pd.Series) -> pd.Series:

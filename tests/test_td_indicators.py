@@ -85,6 +85,22 @@ def test_mfi_divergence_columns_are_boolean() -> None:
     assert result["mfi_bullish_divergence"].dtype == bool
 
 
+def test_sell_setup_perfection_requires_bar_to_exceed_both_bar6_and_bar7() -> None:
+    close = np.arange(10.0, 80.0, 2.0)
+    frame = make_ohlcv(close)
+    # bar 9 (index 12) only clears bar 7's high (index 10), not bar 6's (index 9);
+    # bar 8 (index 11) clears neither. Perfection requires one of bar 8/9 to clear BOTH.
+    frame.loc[frame.index[9], "high"] = 100.0
+    frame.loc[frame.index[10], "high"] = 50.0
+    frame.loc[frame.index[11], "high"] = 40.0
+    frame.loc[frame.index[12], "high"] = 60.0
+
+    result = compute_all_indicators(frame)
+
+    assert result.loc[result.index[12], "td_sell_setup"] == 9
+    assert not bool(result.loc[result.index[12], "td_sell_perfected"])
+
+
 def test_scanner_sized_indicator_computation_is_fast_enough() -> None:
     close = 100 + np.cumsum(np.sin(np.arange(504) / 7.0) + 0.15)
     frames = [make_ohlcv(close + i) for i in range(25)]
